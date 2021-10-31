@@ -156,40 +156,6 @@ Resources:
       LogGroupName: !Sub "/terraform/codebuild/${AWS::StackName}"
       RetentionInDays: 7
 
-  # CodePipelineArtifactStoreBucketPolicy:
-  #   Type: 'AWS::S3::BucketPolicy'
-  #   Properties:
-  #     Bucket: !Ref CodePipelineArtifactStoreBucket
-  #     PolicyDocument:
-  #       Version: 2012-10-17
-  #       Statement:
-  #         - Sid: DenyUnEncryptedObjectUploads
-  #           Effect: Deny
-  #           Principal: '*'
-  #           Action: 's3:PutObject'
-  #           Resource: !Join
-  #             - ''
-  #             - - !GetAtt
-  #                 - CodePipelineArtifactStoreBucket
-  #                 - Arn
-  #               - /*
-  #           Condition:
-  #             StringNotEquals:
-  #               's3:x-amz-server-side-encryption': 'aws:kms'
-  #         - Sid: DenyInsecureConnections
-  #           Effect: Deny
-  #           Principal: '*'
-  #           Action: 's3:*'
-  #           Resource: !Join
-  #             - ''
-  #             - - !GetAtt
-  #                 - CodePipelineArtifactStoreBucket
-  #                 - Arn
-  #               - /*
-  #           Condition:
-  #             Bool:
-  #               'aws:SecureTransport': false
-
   AmazonCloudWatchEventRole:
     Type: 'AWS::IAM::Role'
     Properties:
@@ -271,20 +237,6 @@ Resources:
               Configuration:
                 ProjectName: !Ref ApplyCodeBuild
               RunOrder: 1
-        # - Name: Beta
-        #   Actions:
-        #     - Name: BetaAction
-        #       InputArtifacts:
-        #         - Name: SourceOutput
-        #       ActionTypeId:
-        #         Category: Deploy
-        #         Owner: AWS
-        #         Version: 1
-        #         Provider: CodeDeploy
-        #       Configuration:
-        #         ApplicationName: !Ref ApplicationName
-        #         DeploymentGroupName: !Ref BetaFleet
-        #       RunOrder: 1
       ArtifactStore:
         Type: S3
         Location: !Ref CodePipelineArtifactStoreBucket
