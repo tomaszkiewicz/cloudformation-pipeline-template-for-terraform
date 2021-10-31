@@ -1,0 +1,370 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: The template provisions everything you need to run Terraform in an automated way
+
+Parameters:
+  TrustedAwsPrincipals:
+    Description: |
+      A comma-separated list of principal ARNs that should be able to assume a role created for Terraform.
+      Use this parameter to enable usage of Terraform on workstations.
+    Type: CommaDelimitedList
+    Default: ""
+
+  TerraformVersion:
+    Description: Use this parameter to override default Terraform version
+    Type: String
+    Default: "1.0.10"
+
+Outputs:
+  CloneUrlSsh:
+    Description: Shell command for connecting to the CodeCommit repo, make sure to configure your ssh for AWS CodeCommit first
+    Value: !Sub "git clone ${CodeCommitRepository.CloneUrlSsh}"
+
+  TerraformBackendTemplate:
+    Value: !Sub |
+      # put this to terraform_backend.tf in the repostiroy
+      terraform {
+        backend "s3" {
+          bucket         = "${TerraformStateBucket}"
+          key            = "main"
+          region         = "${AWS::Region}"
+          role_arn       = "${TerraformRole.Arn}"
+          dynamodb_table = "${TerraformLockTable}"
+        }
+      }
+  TerraformProviderTemplate:
+    Value: !Sub |
+      # put this to provider.tf in the repository
+      terraform {
+        required_providers {
+          aws = {
+            source  = "hashicorp/aws"
+            version = "3.63.0"
+          }
+        }
+      }
+
+      provider "aws" {
+        region              = "${AWS::Region}"
+        allowed_account_ids = ["${AWS::AccountId}"]
+        assume_role {
+          role_arn = "${TerraformRole.Arn}"
+        }
+      }
+
+Conditions:
+  HasTrustedAwsPrincipals: !Not [!Equals [!Join ['', !Ref TrustedAwsPrincipals], '']]
+
+Resources:
+  TerraformStateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Join ['-', [!Sub 'terraform-state-${AWS::StackName}', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      VersioningConfiguration:
+        Status: Enabled
+
+  TerraformLockTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: LockID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: LockID
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+      TableName: !Sub 'terraform-lock-${AWS::StackName}'
+
+  TerraformRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'terraform-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              AWS: !If [HasTrustedAwsPrincipals, !Split [",", !Join [",", [!GetAtt CodeBuildRole.Arn, !Join [",", !Ref "TrustedAwsPrincipals"]]]], !GetAtt CodeBuildRole.Arn]
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AdministratorAccess
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'terraform-codebuild-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "codebuild"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "sts:AssumeRole"
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/terraform-${AWS::StackName}"
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+
+                  - "codebuild:CreateReportGroup"
+                  - "codebuild:CreateReport"
+                  - "codebuild:UpdateReport"
+                  - "codebuild:BatchPutTestCases"
+                  - "codebuild:BatchPutCodeCoverages"
+
+                  - "ec2:CreateNetworkInterfacePermission"
+                  - "ec2:CreateNetworkInterface"
+                  - "ec2:DescribeDhcpOptions"
+                  - "ec2:DescribeNetworkInterfaces"
+                  - "ec2:DeleteNetworkInterface"
+                  - "ec2:DescribeSubnets"
+                  - "ec2:DescribeSecurityGroups"
+                  - "ec2:DescribeVpcs"
+                Resource: "*"
+
+              - Effect: "Allow"
+                Action:
+                  - "s3:Put*"
+                  - "s3:Get*"
+                Resource:
+                - !Sub '${CodePipelineArtifactStoreBucket.Arn}/*'
+
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub 'terraform-${AWS::StackName}'
+
+  CodePipelineArtifactStoreBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Join ['-', [!Sub 'terraform-codebuild-artifacts-${AWS::StackName}', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/terraform/codebuild/${AWS::StackName}"
+      RetentionInDays: 7
+
+  # CodePipelineArtifactStoreBucketPolicy:
+  #   Type: 'AWS::S3::BucketPolicy'
+  #   Properties:
+  #     Bucket: !Ref CodePipelineArtifactStoreBucket
+  #     PolicyDocument:
+  #       Version: 2012-10-17
+  #       Statement:
+  #         - Sid: DenyUnEncryptedObjectUploads
+  #           Effect: Deny
+  #           Principal: '*'
+  #           Action: 's3:PutObject'
+  #           Resource: !Join
+  #             - ''
+  #             - - !GetAtt
+  #                 - CodePipelineArtifactStoreBucket
+  #                 - Arn
+  #               - /*
+  #           Condition:
+  #             StringNotEquals:
+  #               's3:x-amz-server-side-encryption': 'aws:kms'
+  #         - Sid: DenyInsecureConnections
+  #           Effect: Deny
+  #           Principal: '*'
+  #           Action: 's3:*'
+  #           Resource: !Join
+  #             - ''
+  #             - - !GetAtt
+  #                 - CodePipelineArtifactStoreBucket
+  #                 - Arn
+  #               - /*
+  #           Condition:
+  #             Bool:
+  #               'aws:SecureTransport': false
+
+  AmazonCloudWatchEventRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub 'terraform-cwe-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: cwe-pipeline-execution
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 'codepipeline:StartPipelineExecution'
+                Resource: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${TerraformPipeline}'
+
+  AmazonCloudWatchEventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub "terraform-${AWS::StackName}"
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - !GetAtt CodeCommitRepository.Arn
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - main
+      Targets:
+        - Arn: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${TerraformPipeline}'
+          RoleArn: !GetAtt AmazonCloudWatchEventRole.Arn
+          Id: codepipeline-apppipeline
+
+  TerraformPipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      Name: !Sub "terraform-${AWS::StackName}"
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                BranchName: main
+                RepositoryName: !GetAtt CodeCommitRepository.Name
+                PollForSourceChanges: false
+              RunOrder: 1
+        - Name: Apply
+          Actions:
+            - Name: TerraformApply
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutputArtifact
+              Configuration:
+                ProjectName: !Ref ApplyCodeBuild
+              RunOrder: 1
+        # - Name: Beta
+        #   Actions:
+        #     - Name: BetaAction
+        #       InputArtifacts:
+        #         - Name: SourceOutput
+        #       ActionTypeId:
+        #         Category: Deploy
+        #         Owner: AWS
+        #         Version: 1
+        #         Provider: CodeDeploy
+        #       Configuration:
+        #         ApplicationName: !Ref ApplicationName
+        #         DeploymentGroupName: !Ref BetaFleet
+        #       RunOrder: 1
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineArtifactStoreBucket
+
+  CodePipelineServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub "terraform-codepipeline-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: codepipeline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'codecommit:CancelUploadArchive'
+                  - 'codecommit:GetBranch'
+                  - 'codecommit:GetCommit'
+                  - 'codecommit:GetUploadArchiveStatus'
+                  - 'codecommit:UploadArchive'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                Resource: '*'
+              - Effect: "Allow"
+                Action:
+                  - "s3:Put*"
+                  - "s3:Get*"
+                Resource:
+                - !Sub '${CodePipelineArtifactStoreBucket.Arn}/*'
+
+  ApplyCodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ConcurrentBuildLimit: 1
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
+        Type: LINUX_CONTAINER
+        ImagePullCredentialsType: CODEBUILD
+        EnvironmentVariables:
+        - Name: TF_IN_AUTOMATION
+          Value: true
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/terraform/codebuild/${AWS::StackName}"
+      Name: !Join ['-', [!Sub 'terraform-${AWS::StackName}', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      QueuedTimeoutInMinutes: 10
+      ServiceRole: !Ref CodeBuildRole
+      TimeoutInMinutes: 120
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.2
+
+          phases:
+            install:
+              commands:
+              - wget -q https://releases.hashicorp.com/terraform/${TerraformVersion}/terraform_${TerraformVersion}_linux_amd64.zip -O /tmp/terraform.zip
+              - unzip /tmp/terraform.zip -d /bin
+            pre_build:
+              commands:
+              - whoami
+              - aws sts get-caller-identity
+              - terraform version
+            build:
+              commands:
+              - terraform get
+              - terraform init -input=false
+              - terraform apply -input=false -auto-approve
